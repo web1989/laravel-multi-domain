@@ -1,0 +1,225 @@
+Dynamic custom domain routing in Laravel revisited
+A different approach to implementing custom domains and subdomains
+Back in November 2015, I wrote a Medium post about using Laravel's subdomain routing feature with custom domain names, something that is important for many multi-tenant applications. There was always one thing about this solution that bugged me however, and recently I decided to take a second look at the problem to try and come up with a better approach.
+
+The original solution
+The original solution I found for using custom domains in Laravel was to add a global route pattern to RouteServiceProvider that changed the regular expression for subdomain matching to allow for full domains:
+
+Route::pattern('domain', '[a-z0-9.\]+');
+This allowed you to use the domain routing feature as follows:
+
+Route::domain('{domain}')->group(function() {
+    Route::get('users/{user}', function (Request $request, string $domain, User $user) {
+        // Your code here
+    });
+});
+While this works very well, it means you need to add the $domain argument to all your route actions, even if you don't need them for the route in question. At the time I found it an acceptable consequence of the solution, but I've always wanted to try to find a better way.
+
+The better way
+The improved solution required completely forgetting that subdomain routing exists in Laravel the first place. Instead, we can use a simple middleware to look up the appropriate tenant based on the request host and add data to the request object so it can be used elsewhere in the application. The simplest implementation of this could be the following middleware class:
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use App\Tenant;
+
+class CustomDomain
+{
+    /**
+     * Handle an incoming request.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  \Closure  $next
+     * @return mixed
+     */
+    public function handle($request, Closure $next)
+    {
+        $domain = $request->getHost();
+        $tenant = Tenant::where('domain', $domain)->firstOrFail();
+
+        // Append domain and tenant to the Request object
+        // for easy retrieval in the application.
+        $request->merge([
+            'domain' => $domain,
+            'tenant' => $tenant
+        ]);
+
+        return $next($request);
+    }
+}
+Here, I'm assuming you have a Laravel model named Tenant which has an attribute domain which contains the full domain name you want to use for the tenant in question.
+
+Now, in your app/Http/Kernel.php file, you can add a middleware group or route middleware that includes this new middleware. I like to create a new group for domain routes, which can be useful if there are other middleware I need to apply specifically to custom domain routes:
+
+...
+protected $middlewareGroups = [
+    ...
+    'domain' => [
+        \App\Http\Middleware\CustomDomain::class,
+    ],
+    ...
+];
+Now, I can assing this middleware group to any routes that should be served up under a custom domain. Personally, I like to create a new routes/tenant.php routes file, and then in app/Providers/RouteServiceProvider.php add a new method for mapping tenant routes, complete with namespace and route name prefixing, such as:
+
+public function map()
+{
+    $this->mapApiRoutes();
+    $this->mapWebRoutes();
+    $this->mapTenantRoutes();
+}
+
+protected function mapTenantRoutes()
+{
+    Route::middleware(['web', 'auth', 'domain'])
+        ->namespace("$this->namespace\Tenant")
+        ->name('tenant.')
+        ->group(base_path('routes/tenant.php'));
+}
+The final piece of the puzzle is how to access information about the tenant from your controller actions, views and other parts of your application. After all, you're going to need to know the tenant to correctly filter requests and what not. Unlike the previous solution, this approach does not add the $domain argument to your route action methods. Instead, you can simply read the tenant information off the request object itself. The following is an example of a controller action that does just that:
+
+public function index(Request $request)
+{
+    $tenant = $request->tenant;
+
+    ...
+}
+If you're using Blade templates in your application, the CustomDomain middleware is also a good place to share any data that may be useful to your views that is different based on the tenant:
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use App\Tenant;
+use Illuminate\Support\Facades\View;
+
+class CustomDomain
+{
+    /**
+     * Handle an incoming request.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  \Closure  $next
+     * @return mixed
+     */
+    public function handle($request, Closure $next)
+    {
+        $domain = $request->getHost();
+        $tenant = Tenant::where('domain', $domain)->firstOrFail();
+
+        // Append domain and tenant to the Request object
+        // for easy retrieval in the application.
+        $request->merge([
+            'domain' => $domain,
+            'tenant' => $tenant
+        ]);
+
+        // Share tentant data with your views for easier
+        // customization across the board
+        View::share('tenantColor', $tenant->color);
+        View::share('tenantName', $tenant->name);
+
+        return $next($request);
+    }
+}
+Other considerations
+The following are some other things you'll likely encounter when you use this approach to enable custom domains in your application.
+
+Authentication
+You'll most likely want to enable users of your application to only be able to login under the tenant they belong to. To do this, you may store a tenant_id attribute on your user model, and amend your authentication to take this into account when logging in. You can do this by overriding the credentials method on the stock Laravel app/Http/Controllers/Auth/LoginController.php file. The default method (which comes from the AuthenticatesUsers trait) is as follows:
+
+protected function credentials(Request $request)
+{
+    return $request->only($this->username(), 'password');
+}
+Making this tenant aware is as simple as changing this to the following:
+
+protected function credentials(Request $request)
+{
+    $credentials = $request->only($this->username(), 'password');
+
+    $credentials['tenant_id'] = optional($request->tenant)->id;
+
+    return $credentials;
+}
+Now users will only be able to login under the domain associated with the tenant their user model is related to.
+
+You will also likely want to consider how your auth routes are mapped. By default, Laravel's authentication routes are added to routes/web.php, but if you want to use the tenant middleware in your auth routes (for customisation or other reasons) you might find it better to create a new method in your RouteServiceProvider specifically for auth routes, such as:
+
+protected function mapAuthRoutes()
+{
+    Route::middleware(['web', 'domain'])
+        ->namespace("$this->namespace\Auth")
+        ->name('auth.')
+        ->group(base_path('routes/auth.php'));
+}
+Subdomains
+While the goal of this is to enable support for custom domains in a Laravel application, you can still of course continue to serve subdomains and use the same approach as described here. The main difference between this solution and the built-in subdomain routing feature is that with this approach you need to store the full domain for your tenant rather than just the subdomain prefix.
+
+Root and other non-tenant domains
+In some instances, you may want to serve up something under your application's root domain or under a specific domain that is not used by a specific tenant. This could be for an administration panel or some other functionality. One approach you could take here is to set a config for the domain you want to use and add a check for this if a tenant is not found in your CustomDomain middleware.
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use App\Tenant;
+use Illuminate\Support\Facades\View;
+
+class CustomDomain
+{
+    /**
+     * Handle an incoming request.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  \Closure  $next
+     * @return mixed
+     */
+    public function handle($request, Closure $next)
+    {
+        $domain = $request->getHost();
+        $tenant = Tenant::where('domain', $domain)->first();
+
+        if (!$tenant) {
+            $adminDomain = config('app.admin_domain');
+
+            if ($domain != $adminDomain) {
+                abort(404);
+            }
+        }
+
+        // Append domain and tenant to the Request object
+        // for easy retrieval in the application.
+        $request->merge([
+            'domain' => $domain,
+            'tenant' => $tenant
+        ]);
+
+        if ($tenant) {
+            View::share('tenantColor', $tenant->color);
+            View::share('tenantName', $tenant->name);
+        }
+
+        return $next($request);
+    }
+}
+For the view data, you could add fallbacks directly in the middleware here or alternatively you can add these to your app/Providers/AppServiceProvider.php in the boot method.
+
+...
+
+public function boot()
+{
+    ...
+
+    View::share('tenantColor', 'gray');
+    View::share('tenantName', 'Admin');
+
+    ...
+}
+
+...
+Conclusion
+And that's about it! Overall I find this approach to be a cleaner method of implementing custom domains (and indeed subdomains) in a Laravel application. If you have any suggestions on how the above approach can be improved, feel free to reach out to me on Twitter @joelennon.
